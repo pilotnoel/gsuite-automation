@@ -1,6 +1,6 @@
 /**
  * Member Synchronization Module
- * 
+ *
  * Manages synchronization between CAPWATCH data and Google Workspace:
  * - Retrieves and parses CAPWATCH member data
  * - Creates/updates Google Workspace user accounts
@@ -13,7 +13,7 @@
 /**
  * Gets all squadrons for the configured wing from CAPWATCH data
  * Includes both regular squadrons and special units (e.g., AEM)
- * 
+ *
  * @returns {Object} Squadron data indexed by orgid with properties:
  *   - orgid: Organization ID
  *   - name: Squadron name
@@ -27,7 +27,7 @@
 function getSquadrons() {
   let squadrons = {};
   let squadronData = parseFile('Organization');
-  
+
   for (let i = 0; i < squadronData.length; i++) {
     if (squadronData[i][2] === CONFIG.WING) {
       squadrons[squadronData[i][0]] = {
@@ -63,14 +63,14 @@ function getSquadrons() {
 
 /**
  * Retrieves and processes member data from CAPWATCH files
- * 
+ *
  * This is the main data retrieval function that:
  * 1. Parses member data from CAPWATCH files
  * 2. Filters by member type and status
  * 3. Validates member data
  * 4. Adds contact information
  * 5. Optionally adds duty positions
- * 
+ *
  * @param {string[]} types - Member types to include (default: all active types)
  * @param {boolean} includeDutyPositions - Whether to parse duty positions (default: true)
  * @returns {Object} Members object indexed by CAPID
@@ -79,40 +79,40 @@ function getMembers(types = CONFIG.MEMBER_TYPES.ACTIVE, includeDutyPositions = t
   const start = new Date();
   const members = {};
   const squadrons = getSquadrons();
-  
+
   Logger.info('Starting member data retrieval', { types: types });
-  
+
   // Build member objects from Member.txt
   const memberData = parseFile('Member');
   let processedCount = 0;
-  
+
   for (let i = 0; i < memberData.length; i++) {
     if (shouldProcessMember(memberData[i], types)) {
       const member = createMemberObject(memberData[i], squadrons);
-      
+
       // Validate before adding
       const validation = validateMember(member);
       if (validation.isValid) {
         members[memberData[i][0]] = member;
         processedCount++;
       } else {
-        Logger.warn('Invalid member data', { 
+        Logger.warn('Invalid member data', {
           capsn: memberData[i][0],
-          errors: validation.errors 
+          errors: validation.errors
         });
       }
     }
   }
-  
-  Logger.info('Members parsed', { 
+
+  Logger.info('Members parsed', {
     count: processedCount,
     duration: new Date() - start + 'ms'
   });
-  
+
   // Add contact information from MbrContact.txt
   const contactStart = new Date();
   addContactInfo(members, parseFile('MbrContact'));
-  Logger.info('Contact info added', { 
+  Logger.info('Contact info added', {
     duration: new Date() - contactStart + 'ms'
   });
 
@@ -121,36 +121,37 @@ function getMembers(types = CONFIG.MEMBER_TYPES.ACTIVE, includeDutyPositions = t
     const dutyStart = new Date();
     addDutyPositions(members, parseFile('DutyPosition'), squadrons);
     addCadetDutyPositions(members, parseFile('CadetDutyPositions'), squadrons);
-    Logger.info('Duty positions added', { 
+    assignManagerEmails(members);
+    Logger.info('Duty positions added', {
       duration: new Date() - dutyStart + 'ms'
     });
   }
-  
-  Logger.info('Member retrieval completed', { 
+
+  Logger.info('Member retrieval completed', {
     totalMembers: Object.keys(members).length,
     totalDuration: new Date() - start + 'ms'
   });
-  
+
   return members;
 }
 
 /**
  * Determines if a member should be processed based on status and type
- * 
+ *
  * @param {Array} memberRow - Raw member data row from CSV
  * @param {string[]} types - Valid member types to include
  * @returns {boolean} True if member should be processed
  */
 function shouldProcessMember(memberRow, types) {
-  return memberRow[24] === 'ACTIVE' && 
-         memberRow[13] != 0 && 
-         memberRow[13] != 999 && 
+  return memberRow[24] === 'ACTIVE' &&
+         memberRow[13] != 0 &&
+         memberRow[13] != 999 &&
          types.indexOf(memberRow[21]) > -1;
 }
 
 /**
  * Creates a structured member object from raw CAPWATCH data
- * 
+ *
  * @param {Array} memberRow - Raw member data row from CSV
  * @param {Object} squadrons - Squadron lookup object
  * @returns {Object} Formatted member object with all required fields
@@ -163,6 +164,7 @@ function createMemberObject(memberRow, squadrons) {
     orgid: memberRow[11],
     group: calculateGroup(memberRow[11], squadrons),
     charter: squadrons[memberRow[11]].charter,
+    orgName: squadrons[memberRow[11]].name,
     rank: memberRow[14],
     type: memberRow[21],
     status: memberRow[24],
@@ -176,34 +178,49 @@ function createMemberObject(memberRow, squadrons) {
 }
 
 /**
- * Adds contact information (email) to member objects
- * Only adds PRIMARY email addresses after sanitization
- * 
+ * Adds primary email and phone contact information to member objects.
+ * Reads CAPWATCH MbrContact.txt where:
+ * [0]=CAPID, [1]=Type, [2]=Priority, [3]=Contact, [6]=DoNotContact
+ *
+ * - Only adds PRIMARY contacts
+ * - Skips DoNotContact=True
+ * - Accepts EMAIL and CELL PHONE types
+ * - Sanitizes both before storing
+ *
  * @param {Object} members - Members object indexed by CAPID
  * @param {Array} contactData - Parsed contact data from MbrContact.txt
- * @returns {void}
  */
 function addContactInfo(members, contactData) {
   for (let i = 0; i < contactData.length; i++) {
-    if (members[contactData[i][0]] && 
-        contactData[i][2] === 'PRIMARY' && 
-        contactData[i][1] === 'EMAIL') {
-      const sanitizedEmail = sanitizeEmail(contactData[i][3]);
-      if (sanitizedEmail) {
-        members[contactData[i][0]].email = sanitizedEmail;
-      } else {
-        Logger.warn('Invalid email format - skipping', {
-          capsn: contactData[i][0],
-          rawEmail: contactData[i][3]
-        });
+    const capid = contactData[i][0];
+    const type = contactData[i][1]?.toUpperCase() || '';
+    const priority = contactData[i][2]?.toUpperCase() || '';
+    const contact = contactData[i][3]?.trim() || '';
+    const doNotContact = contactData[i][6]?.toUpperCase() === 'TRUE';
+
+    if (!members[capid] || priority !== 'PRIMARY' || doNotContact) continue;
+
+    if (type === 'EMAIL') {
+      const email = sanitizeEmail(contact);
+      if (email) members[capid].email = email;
+    }
+
+    if (type.includes('CELL') || type === 'PHONE') {
+      const digits = contact.replace(/\D/g, '');
+      if (digits.length >= 10) {
+        members[capid].phone = `+1${digits.slice(-10)}`;
       }
     }
   }
+
+  Logger.info('Contact info added (email + phone)', {
+    totalMembers: Object.keys(members).length
+  });
 }
 
 /**
  * Adds senior member duty positions to member objects
- * 
+ *
  * @param {Object} members - Members object indexed by CAPID
  * @param {Array} dutyPositionData - Parsed duty position data
  * @param {Object} squadrons - Squadron lookup object
@@ -214,9 +231,9 @@ function addDutyPositions(members, dutyPositionData, squadrons) {
     if (members[dutyPositionData[i][0]]) {
       let dutyPositionID = dutyPositionData[i][1].trim();
       members[dutyPositionData[i][0]].dutyPositions.push({
-        value: Utilities.formatString("%s (%s) (%s)", 
-          dutyPositionID, 
-          (dutyPositionData[i][4] == '1' ? 'A' : 'P'), 
+        value: Utilities.formatString("%s (%s) (%s)",
+          dutyPositionID,
+          (dutyPositionData[i][4] == '1' ? 'A' : 'P'),
           squadrons[dutyPositionData[i][7]].charter),
         id: dutyPositionID,
         level: dutyPositionData[i][3],
@@ -232,7 +249,7 @@ function addDutyPositions(members, dutyPositionData, squadrons) {
 
 /**
  * Adds cadet duty positions to member objects
- * 
+ *
  * @param {Object} members - Members object indexed by CAPID
  * @param {Array} cadetDutyPositionData - Parsed cadet duty position data
  * @param {Object} squadrons - Squadron lookup object
@@ -242,9 +259,9 @@ function addCadetDutyPositions(members, cadetDutyPositionData, squadrons) {
   for (let i = 0; i < cadetDutyPositionData.length; i++) {
     if (members[cadetDutyPositionData[i][0]]) {
       members[cadetDutyPositionData[i][0]].dutyPositions.push({
-        value: Utilities.formatString("%s (%s) (%s)", 
-          cadetDutyPositionData[i][1], 
-          (cadetDutyPositionData[i][4] == '1' ? 'A' : 'P'), 
+        value: Utilities.formatString("%s (%s) (%s)",
+          cadetDutyPositionData[i][1],
+          (cadetDutyPositionData[i][4] == '1' ? 'A' : 'P'),
           squadrons[cadetDutyPositionData[i][7]].charter)
       });
       members[cadetDutyPositionData[i][0]].dutyPositionIds.push(
@@ -257,7 +274,7 @@ function addCadetDutyPositions(members, cadetDutyPositionData, squadrons) {
 /**
  * Retrieves Aerospace Education Members only
  * Convenience function that calls getMembers with AEM filter
- * 
+ *
  * @returns {Object} AEM members object indexed by CAPID
  */
 function getAEMembers() {
@@ -267,13 +284,13 @@ function getAEMembers() {
 /**
  * Retrieves previously saved member data from Drive
  * Used to detect changes and avoid unnecessary API calls
- * 
+ *
  * @returns {Object} Previously saved member data or empty object
  */
 function getCurrentMemberData() {
   let folder = DriveApp.getFolderById(CONFIG.CAPWATCH_DATA_FOLDER_ID);
   let files = folder.getFilesByName('CurrentMembers.txt');
-  
+
   if (files.hasNext()) {
     let content = files.next().getBlob().getDataAsString();
     if (content) {
@@ -285,202 +302,188 @@ function getCurrentMemberData() {
       }
     }
   }
-  
+
   Logger.warn('CurrentMembers.txt not found or empty');
   return {};
 }
 
 /**
  * Saves current member data to Drive for change detection
- * 
+ *
  * @param {Object} currentMembers - Current member data to save
  * @returns {void}
  */
 function saveCurrentMemberData(currentMembers) {
-  let folder = DriveApp.getFolderById(CONFIG.CAPWATCH_DATA_FOLDER_ID);
-  let files = folder.getFilesByName('CurrentMembers.txt');
-  
+  const folder = DriveApp.getFolderById(CONFIG.CAPWATCH_DATA_FOLDER_ID);
+  const files = folder.getFilesByName('CurrentMembers.txt');
+  const content = JSON.stringify(currentMembers);
+
   if (files.hasNext()) {
-    let file = files.next();
-    let content = JSON.stringify(currentMembers);
+    const file = files.next();
     file.setContent(content);
-    Logger.info('Current member data saved', { 
+    Logger.info('Current member data saved', {
       memberCount: Object.keys(currentMembers).length,
       fileName: 'CurrentMembers.txt'
     });
   } else {
-    Logger.warn('CurrentMembers.txt not found - cannot save', {
-      folderId: CONFIG.CAPWATCH_DATA_FOLDER_ID
+    // Auto-create the file if missing
+    folder.createFile('CurrentMembers.txt', content, MimeType.PLAIN_TEXT);
+    Logger.info('Created new CurrentMembers.txt', {
+      memberCount: Object.keys(currentMembers).length
     });
   }
 }
 
 /**
  * Checks if a member's data has changed since last update
- * Compares rank, charter, duty positions, status, and email
- * 
+ * Now includes: rank, charter, duty positions, status, email,
+ * type, duty title, manager email, and contact information.
+ *
  * @param {Object} newMember - New member data
  * @param {Object} previousMember - Previously saved member data
  * @returns {boolean} True if member data has changed or is new
  */
 function memberUpdated(newMember, previousMember) {
-  return (!newMember || !previousMember) || 
-         (newMember.rank !== previousMember.rank || 
-          newMember.charter !== previousMember.charter || 
-          newMember.dutyPositions.join('') !== previousMember.dutyPositions.join('') || 
-          newMember.status !== previousMember.status ||
-          newMember.email !== previousMember.email);
+  if (!newMember || !previousMember) return true;
+
+  // Normalize missing fields
+  const safe = (v) => (v || '').toString().trim();
+
+  return (
+    safe(newMember.rank) !== safe(previousMember.rank) ||
+    safe(newMember.charter) !== safe(previousMember.charter) ||
+    safe(newMember.status) !== safe(previousMember.status) ||
+    safe(newMember.email) !== safe(previousMember.email) ||
+    safe(newMember.type) !== safe(previousMember.type) ||
+    safe(newMember.managerEmail) !== safe(previousMember.managerEmail) ||
+    safe(newMember.phone) !== safe(previousMember.phone) ||
+    safe(newMember.recoveryEmail) !== safe(previousMember.recoveryEmail) ||
+    safe(newMember.recoveryPhone) !== safe(previousMember.recoveryPhone) ||
+    safe(newMember.emails && newMember.emails[0]?.address) !== safe(previousMember.emails && previousMember.emails[0]?.address) ||
+    newMember.dutyPositions.join('') !== previousMember.dutyPositions.join('')
+  );
 }
 
 /**
  * Updates or creates a Google Workspace user for a CAP member
- * 
+ *
  * Process:
  * 1. Attempts to update existing user
  * 2. If not found, creates new user
  * 3. Adds email alias for new users
  * 4. Suspends users in excluded organizations
- * 
+ *
  * @param {Object} member - Member object containing CAP data
  * @returns {void}
  */
 function addOrUpdateUser(member) {
-  let primaryEmail = member.capsn + CONFIG.EMAIL_DOMAIN;
-  let user;
-  
-  let updates = {
+  const isRegion = CONFIG.REGION && CONFIG.REGION === "PCR";
+
+  // Primary email (firstname.lastname@domain)
+  const baseEmail = `${member.firstName}.${member.lastName}`.toLowerCase().replace(/\s+/g, '');
+  const primaryEmail = `${baseEmail}@${CONFIG.DOMAIN}`;
+  const regionAlias = isRegion ? `${baseEmail}@pcr.cap.gov` : null;
+
+  // Determine primary duty position (non-assistant)
+  let primaryDuty = '';
+  if (member.dutyPositions && member.dutyPositions.length > 0) {
+    const primary = member.dutyPositions.find(dp => !dp.assistant);
+    primaryDuty = primary ? primary.id : member.dutyPositions[0].id;
+  }
+
+  // Extract mobile phone
+  let mobilePhone = null;
+  if (member.phone) {
+    const digits = member.phone.replace(/\D/g, '');
+    if (digits.length >= 10) mobilePhone = `+1${digits.slice(-10)}`;
+  }
+
+  const userResource = {
+    name: {
+      givenName: member.firstName,
+      familyName: member.lastName,
+      fullName: `${member.firstName} ${member.lastName}`,
+      displayName: `${member.lastName}, ${member.firstName} ${member.rank || ''}`.trim()
+    },
     orgUnitPath: member.orgPath,
-    recoveryEmail: member.email,
-    suspended: CONFIG.EXCLUDED_ORG_IDS.includes(String(member.orgid)),
-    customSchemas: {
-      MemberData: {
-        CAPID: member.capsn,
-        Rank: member.rank,
-        Organization: member.charter,
-        DutyPosition: member.dutyPositions,
-        Type: member.type,
-        LastUpdated: Utilities.formatDate(new Date(), "GMT", "yyyy-MM-dd")
-      }
-    }
+    suspended: false,
+    externalIds: [{ value: String(member.capsn), type: 'organization' }],
+    phones: mobilePhone ? [{ type: 'mobile', value: mobilePhone }] : [],
+    emails: member.email ? [{ address: member.email, type: 'other', primary: false }] : [],
+    recoveryEmail: member.email || '',
+    recoveryPhone: mobilePhone || '',
+    organizations: [{
+      title: primaryDuty || 'Member',
+      department: toTitleCase(member.orgName || ''),
+      type: 'work',
+      primary: true,
+      description: member.type || ''
+    }],
+    relations: member.managerEmail
+      ? [{ type: 'manager', value: member.managerEmail }]
+      : [],
+    customSchemas: { CAP: { Rank: member.rank || '' } },
+    changePasswordAtNextLogin: false
   };
 
-  // Try updating existing user
   try {
-    user = executeWithRetry(() =>
-      AdminDirectory.Users.update(updates, primaryEmail)
-    );
-    Logger.info('User updated', { 
-      email: primaryEmail,
-      capsn: member.capsn
-    });
-  } catch (e) {
-    Logger.error('Unable to update user', {
-      email: primaryEmail,
-      capsn: member.capsn,
-      name: member.firstName + ' ' + member.lastName,
-      orgid: member.orgid,
-      charter: member.charter,
-      orgPath: member.orgPath,
-      errorMessage: e.message,
-      errorCode: e.details?.code
-    });
-  }
-  
-  // Create new user if update failed
-  if (!user) {
-    user = {
-      primaryEmail: primaryEmail,
-      name: {
-        givenName: member.firstName,
-        familyName: member.lastName
-      },
-      suspended: CONFIG.EXCLUDED_ORG_IDS.includes(String(member.orgid)),
-      changePasswordAtNextLogin: true,
-      password: Math.random().toString(36),
-      orgUnitPath: member.orgPath,
-      recoveryEmail: member.email,
-      customSchemas: {
-        MemberData: {
-          CAPID: member.capsn,
-          Rank: member.rank,
-          Organization: member.charter,
-          DutyPosition: member.dutyPositions,
-          Type: member.type,
-          LastUpdated: Utilities.formatDate(new Date(), "GMT", "yyyy-MM-dd")
-        }
-      }
-    };
+    // First try to update
+    executeWithRetry(() => AdminDirectory.Users.update(userResource, primaryEmail));
+    Logger.info('User updated', { email: primaryEmail, capsn: member.capsn });
 
-    try {
-      let newUser = executeWithRetry(() =>
-        AdminDirectory.Users.insert(user)
-      );
-      Logger.info('New user created', { 
-        email: primaryEmail,
-        capsn: member.capsn,
-        name: member.firstName + ' ' + member.lastName
-      });
-      
-      // Add alias for new user
-      if (newUser) {
-        try {
-          let aliasEmail = member.firstName.replace(/\s/g, '') + '.' + 
-                          member.lastName.replace(/\s/g, '') + CONFIG.EMAIL_DOMAIN;
-          executeWithRetry(() =>
-            AdminDirectory.Users.Aliases.insert({alias: aliasEmail}, primaryEmail)
-          );
-          Logger.info('Email alias added', { 
-            email: primaryEmail,
-            alias: aliasEmail
-          });
-        } catch (aliasError) {
-          Logger.warn('Could not add alias', {
-            email: primaryEmail,
-            errorMessage: aliasError.message,
-            errorCode: aliasError.details?.code
-          });
-        }
+  } catch (updateErr) {
+    if (updateErr.message && updateErr.message.includes('Resource Not Found')) {
+      try {
+        // Create new user if not found
+        const createResource = { ...userResource, primaryEmail, password: Math.random().toString(36) };
+        executeWithRetry(() => AdminDirectory.Users.insert(createResource));
+        Logger.info('User created', { email: primaryEmail, capsn: member.capsn });
+      } catch (insertErr) {
+        Logger.error('Failed to create user', { email: primaryEmail, errorMessage: insertErr.message });
       }
-    } catch (e) {
-      Logger.error('Failed to create new user', {
-        email: primaryEmail,
-        capsn: member.capsn,
-        name: member.firstName + ' ' + member.lastName,
-        orgid: member.orgid,
-        charter: member.charter,
-        orgPath: member.orgPath,
-        errorMessage: e.message,
-        errorCode: e.details?.code
-      });
+    } else {
+      Logger.error('Failed to update user', { email: primaryEmail, errorMessage: updateErr.message });
     }
   }
+
+  // Uncomment when alias domain is ready
+  /*
+  if (regionAlias) {
+    try {
+      AdminDirectory.Users.Aliases.insert({ alias: regionAlias }, primaryEmail);
+      Logger.info('Region alias added', { alias: regionAlias });
+    } catch (aliasErr) {
+      Logger.warn('Could not add region alias', { error: aliasErr.message });
+    }
+  }
+  */
 }
 
 /**
  * Gets all active members from CAPWATCH data
  * Returns simplified object with just CAPID and join date
- * 
+ *
  * @returns {Object} Active members indexed by CAPID with join date values
  */
 function getActiveMembers() {
   let activeMembers = {};
   let memberData = parseFile('Member');
-  
+
   for (let i = 0; i < memberData.length; i++) {
     if (memberData[i][24] === 'ACTIVE') {
       activeMembers[memberData[i][0]] = memberData[i][16];
     }
   }
-  
-  Logger.info('Active members retrieved', { 
-    count: Object.keys(activeMembers).length 
+
+  Logger.info('Active members retrieved', {
+    count: Object.keys(activeMembers).length
   });
   return activeMembers;
 }
 
 /**
  * Suspends a Google Workspace user account
- * 
+ *
  * @param {string} email - User's email address
  * @returns {boolean} True if suspension successful, false otherwise
  */
@@ -504,32 +507,32 @@ function suspendMember(email) {
 /**
  * Retrieves all active (non-suspended) users from Google Workspace
  * Filters to non-admin users in /MI-001 organizational unit
- * 
+ *
  * @returns {Array<Object>} Array of user objects with email, capid, and lastUpdated
  */
 function getActiveUsers() {
   let activeUsers = [];
   let nextPageToken = '';
-  
+
   do {
     let page = AdminDirectory.Users.list({
       domain: CONFIG.DOMAIN,
       maxResults: 500,
       query: 'isSuspended=false isAdmin=false orgUnitPath=/MI-001',
       projection: 'custom',
-      customFieldMask: 'MemberData',      
+      customFieldMask: 'CAP',
       pageToken: nextPageToken
     });
-    
+
     nextPageToken = page.nextPageToken;
-    
+
     if (page.users) {
       for (let i = 0; i < page.users.length; i++) {
-        if (page.users[i].customSchemas && 
-            page.users[i].customSchemas.MemberData && 
+        if (page.users[i].customSchemas &&
+            page.users[i].customSchemas.MemberData &&
             page.users[i].customSchemas.MemberData.CAPID) {
           activeUsers.push({
-            email: page.users[i].primaryEmail, 
+            email: page.users[i].primaryEmail,
             capid: page.users[i].customSchemas.MemberData.CAPID,
             lastUpdated: page.users[i].customSchemas.MemberData.LastUpdated
           });
@@ -537,49 +540,49 @@ function getActiveUsers() {
       }
     }
   } while(nextPageToken);
-  
-  Logger.info('Active users retrieved from Workspace', { 
-    count: activeUsers.length 
+
+  Logger.info('Active users retrieved from Workspace', {
+    count: activeUsers.length
   });
   return activeUsers;
 }
 
 /**
  * Main function to update all member accounts in Google Workspace
- * 
+ *
  * Process:
  * 1. Retrieves current CAPWATCH member data
  * 2. Compares with previously saved data
  * 3. Updates only changed members
  * 4. Saves current data for future comparison
  * 5. Logs progress every 100 members
- * 
+ *
  * @returns {void}
  */
 function updateAllMembers() {
   clearCache(); // Clear cache for fresh data
   const start = new Date();
-  
+
   Logger.info('Starting member update process');
-  
+
   let members = getMembers();
   let currentMembers = getCurrentMemberData();
   const totalMembers = Object.keys(members).length;
-  
+
   let processed = 0;
   let updated = 0;
   let skipped = 0;
-  
+
   for (const capsn in members) {
     processed++;
-    
+
     if (memberUpdated(members[capsn], currentMembers[capsn])) {
       addOrUpdateUser(members[capsn]);
       updated++;
     } else {
       skipped++;
     }
-    
+
     // Log progress every 100 members
     if (processed % 100 === 0) {
       Logger.info('Update progress', {
@@ -591,28 +594,28 @@ function updateAllMembers() {
       });
     }
   }
-  
+
   saveCurrentMemberData(members);
-  
+
   // Reactivate any members who renewed
   Logger.info('Checking for renewed members to reactivate');
   const reactivationStart = new Date();
   let totalReactivated = 0;
-  
+
   try {
     // Get inactive users before calling reactivateRenewedMembers
     const activeMembers = getActiveMembers();
     const inactiveUsers = getInactiveUsers();
     let reactivated = 0;
     let unarchived = 0;
-    
+
     for (let i = 0; i < inactiveUsers.length; i++) {
       const user = inactiveUsers[i];
-      
+
       if (user.capid && (user.capid in activeMembers)) {
         const wasArchived = user.archived;
         const success = reactivateMember(user.email, wasArchived);
-        
+
         if (success) {
           if (wasArchived) {
             unarchived++;
@@ -622,9 +625,9 @@ function updateAllMembers() {
         }
       }
     }
-    
+
     totalReactivated = reactivated + unarchived;
-    
+
     Logger.info('Renewed member reactivation completed', {
       duration: new Date() - reactivationStart + 'ms',
       reactivated: reactivated,
@@ -636,7 +639,7 @@ function updateAllMembers() {
       errorMessage: err.message
     });
   }
-  
+
   Logger.info('Member update completed', {
     duration: new Date() - start + 'ms',
     totalProcessed: processed,
@@ -648,25 +651,25 @@ function updateAllMembers() {
 
 /**
  * Suspends Google Workspace accounts for members who are no longer active in CAPWATCH
- * 
+ *
  * Process:
  * 1. Gets active members from CAPWATCH
  * 2. Gets active users from Google Workspace
  * 3. Identifies users not in CAPWATCH
  * 4. Suspends after grace period expires
- * 
+ *
  * @returns {void}
  */
 function suspendExpiredMembers() {
   const start = new Date();
   Logger.info('Starting expired member suspension process');
-  
+
   let activeMembers = getActiveMembers();
   let users = getActiveUsers();
   let suspended = 0;
   let pending = 0;
   const suspensionTime = new Date().getTime() - (CONFIG.SUSPENSION_GRACE_DAYS * 86400000);
-  
+
   for(let i = 0; i < users.length; i++) {
     if (users[i].capid && !(users[i].capid in activeMembers)) {
       if (!users[i].lastUpdated || suspensionTime > new Date(users[i].lastUpdated).getTime()) {
@@ -685,7 +688,7 @@ function suspendExpiredMembers() {
       }
     }
   }
-  
+
   Logger.info('Expired member suspension completed', {
     duration: new Date() - start + 'ms',
     suspended: suspended,
@@ -696,37 +699,37 @@ function suspendExpiredMembers() {
 
 /**
  * Reactivates Google Workspace accounts for members who renewed after being suspended or archived
- * 
+ *
  * Process:
  * 1. Gets active members from CAPWATCH
  * 2. Gets suspended/archived users from Google Workspace
  * 3. Identifies users who are now active in CAPWATCH
  * 4. Unsuspends and/or unarchives them
- * 
+ *
  * This handles both:
  * - Members who renewed within 1 year (suspended only)
  * - Members who renewed after 1+ year (archived)
- * 
+ *
  * @returns {void}
  */
 function reactivateRenewedMembers() {
   const start = new Date();
   Logger.info('Starting renewed member reactivation process');
-  
+
   const activeMembers = getActiveMembers();
   const inactiveUsers = getInactiveUsers();
   let reactivated = 0;
   let unarchived = 0;
   let failed = 0;
-  
+
   for (let i = 0; i < inactiveUsers.length; i++) {
     const user = inactiveUsers[i];
-    
+
     // Check if user is now active in CAPWATCH
     if (user.capid && (user.capid in activeMembers)) {
       const wasArchived = user.archived;
       const success = reactivateMember(user.email, wasArchived);
-      
+
       if (success) {
         if (wasArchived) {
           unarchived++;
@@ -747,7 +750,7 @@ function reactivateRenewedMembers() {
       }
     }
   }
-  
+
   Logger.info('Renewed member reactivation completed', {
     duration: new Date() - start + 'ms',
     reactivated: reactivated,
@@ -760,7 +763,7 @@ function reactivateRenewedMembers() {
 /**
  * Reactivates a Google Workspace user account
  * Handles both suspended and archived users
- * 
+ *
  * @param {string} email - User's email address
  * @param {boolean} wasArchived - Whether the user was archived (vs just suspended)
  * @returns {boolean} True if reactivation successful, false otherwise
@@ -771,11 +774,11 @@ function reactivateMember(email, wasArchived = false) {
       suspended: false,
       archived: false
     };
-    
+
     executeWithRetry(() =>
       AdminDirectory.Users.update(updateObject, email)
     );
-    
+
     const status = wasArchived ? 'Member unarchived and unsuspended' : 'Member unsuspended';
     Logger.info(status, { email: email });
     return true;
@@ -793,30 +796,30 @@ function reactivateMember(email, wasArchived = false) {
 /**
  * Retrieves all inactive (suspended or archived) users from Google Workspace
  * Filters to non-admin users with CAPID
- * 
+ *
  * @returns {Array<Object>} Array of user objects with email, capid, archived status
  */
 function getInactiveUsers() {
   let inactiveUsers = [];
   let nextPageToken = '';
-  
+
   do {
     let page = AdminDirectory.Users.list({
       domain: CONFIG.DOMAIN,
       maxResults: 500,
       query: 'isSuspended=true isAdmin=false',
       projection: 'custom',
-      customFieldMask: 'MemberData',
+      customFieldMask: 'CAP',
       fields: 'users(primaryEmail,suspended,archived,customSchemas),nextPageToken',
       pageToken: nextPageToken
     });
-    
+
     nextPageToken = page.nextPageToken;
-    
+
     if (page.users) {
       for (let i = 0; i < page.users.length; i++) {
-        if (page.users[i].customSchemas && 
-            page.users[i].customSchemas.MemberData && 
+        if (page.users[i].customSchemas &&
+            page.users[i].customSchemas.MemberData &&
             page.users[i].customSchemas.MemberData.CAPID) {
           inactiveUsers.push({
             email: page.users[i].primaryEmail,
@@ -827,19 +830,19 @@ function getInactiveUsers() {
       }
     }
   } while(nextPageToken);
-  
-  Logger.info('Inactive users retrieved from Workspace', { 
-    count: inactiveUsers.length 
+
+  Logger.info('Inactive users retrieved from Workspace', {
+    count: inactiveUsers.length
   });
   return inactiveUsers;
 }
 
 /**
  * Adds an email alias to a user account with retry logic for conflicts
- * 
+ *
  * Tries firstname.lastname first, then firstname.lastname1, firstname.lastname2, etc.
  * up to 5 attempts if alias already exists
- * 
+ *
  * @param {Object} user - User object with name properties
  * @param {Object} user.name - Name object
  * @param {string} user.name.givenName - First name
@@ -851,10 +854,10 @@ function addAlias(user) {
   const maxRetry = 5;
   let aliasEmail;
   let alias;
-  
+
   // Try setting default alias first
   try {
-    aliasEmail = user.name.givenName.replace(/\s/g, '') + '.' + 
+    aliasEmail = user.name.givenName.replace(/\s/g, '') + '.' +
                  user.name.familyName.replace(/\s/g, '') + CONFIG.EMAIL_DOMAIN;
     alias = AdminDirectory.Users.Aliases.insert({alias: aliasEmail}, user.primaryEmail);
     if (alias) {
@@ -876,11 +879,11 @@ function addAlias(user) {
     }
     // 409 = Conflict, try with number suffix
   }
-  
+
   // Make 5 attempts with incrementing numbers
   for (let index = 1; index <= maxRetry; index++) {
     try {
-      aliasEmail = user.name.givenName.replace(/\s/g, '') + '.' + 
+      aliasEmail = user.name.givenName.replace(/\s/g, '') + '.' +
                    user.name.familyName.replace(/\s/g, '') + index + CONFIG.EMAIL_DOMAIN;
       alias = AdminDirectory.Users.Aliases.insert({alias: aliasEmail}, user.primaryEmail);
       if (alias) {
@@ -904,7 +907,7 @@ function addAlias(user) {
       }
     }
   }
-  
+
   Logger.error('All alias attempts failed', {
     user: user.primaryEmail,
     attempts: maxRetry + 1
@@ -915,7 +918,7 @@ function addAlias(user) {
 /**
  * Finds and updates users who are missing email aliases
  * Processes all non-admin, non-suspended users in /MI-001
- * 
+ *
  * @returns {void}
  */
 function updateMissingAliases() {
@@ -924,24 +927,24 @@ function updateMissingAliases() {
   let totalUpdated = 0;
   let totalFailed = 0;
   let totalProcessed = 0;
-  
+
   Logger.info('Starting missing alias update');
-  
+
   do {
     let page = AdminDirectory.Users.list({
       domain: CONFIG.DOMAIN,
       maxResults: 500,
       query: 'orgUnitPath=/MI-001 isSuspended=false isAdmin=false',
-      fields: 'users(name/givenName,name/familyName,primaryEmail,aliases),nextPageToken',   
+      fields: 'users(name/givenName,name/familyName,primaryEmail,aliases),nextPageToken',
       pageToken: nextPageToken
     });
-    
+
     nextPageToken = page.nextPageToken;
-    
+
     if (page.users) {
       for (let i = 0; i < page.users.length; i++) {
         totalProcessed++;
-        
+
         if (!page.users[i].aliases || page.users[i].aliases.length === 0) {
           let alias = addAlias(page.users[i]);
           if (alias) {
@@ -953,7 +956,7 @@ function updateMissingAliases() {
       }
     }
   } while(nextPageToken);
-  
+
   Logger.info('Missing alias update completed', {
     duration: new Date() - start + 'ms',
     processed: totalProcessed,
@@ -964,7 +967,7 @@ function updateMissingAliases() {
 
 /**
  * Processes members in batches to manage API rate limits
- * 
+ *
  * @param {Object} members - Members object to process
  * @param {number} batchSize - Number of members per batch (default: 50)
  * @returns {void}
@@ -972,34 +975,34 @@ function updateMissingAliases() {
 function batchUpdateMembers(members, batchSize = CONFIG.BATCH_SIZE) {
   const memberArray = Object.values(members);
   const totalBatches = Math.ceil(memberArray.length / batchSize);
-  
+
   Logger.info('Starting batch member update', {
     totalMembers: memberArray.length,
     batchSize: batchSize,
     totalBatches: totalBatches
   });
-  
+
   for (let i = 0; i < memberArray.length; i += batchSize) {
     const batch = memberArray.slice(i, i + batchSize);
     const batchNumber = Math.floor(i / batchSize) + 1;
-    
+
     Logger.info('Processing batch', {
       batch: batchNumber,
       totalBatches: totalBatches,
       batchSize: batch.length
     });
-    
+
     // Process batch
     batch.forEach(member => {
       addOrUpdateUser(member);
     });
-    
+
     // Add delay between batches to avoid rate limits
     if (i + batchSize < memberArray.length) {
       Utilities.sleep(1000); // 1 second delay
     }
   }
-  
+
   Logger.info('Batch update completed', {
     totalMembers: memberArray.length,
     batches: totalBatches
@@ -1009,13 +1012,13 @@ function batchUpdateMembers(members, batchSize = CONFIG.BATCH_SIZE) {
 /**
  * Finds squadrons that are missing organizational unit paths
  * Useful for identifying configuration issues
- * 
+ *
  * @returns {Array<Object>} Array of squadrons missing orgPath
  */
 function findMissingOrgPaths() {
   const squadrons = getSquadrons();
   const missing = [];
-  
+
   for (const orgid in squadrons) {
     if (!squadrons[orgid].orgPath || squadrons[orgid].orgPath === '') {
       missing.push({
@@ -1026,19 +1029,19 @@ function findMissingOrgPaths() {
       });
     }
   }
-  
+
   Logger.info('Missing orgPath check completed', {
     totalSquadrons: Object.keys(squadrons).length,
     missingOrgPaths: missing.length
   });
-  
+
   if (missing.length > 0) {
     Logger.warn('Squadrons missing orgPaths', {
       count: missing.length,
       squadrons: missing
     });
   }
-  
+
   return missing;
 }
 
@@ -1053,11 +1056,11 @@ function findMissingOrgPaths() {
 function testaddOrUpdateUser() {
   Logger.info('Starting test - addOrUpdateUser');
   let members = getMembers();
-  if (members[443777]) {
-    addOrUpdateUser(members[443777]);
+  if (members[107989]) {
+    addOrUpdateUser(members[107989]);
     Logger.info('Test completed');
   } else {
-    Logger.error('Test member not found', { capsn: 443777 });
+    Logger.error('Test member not found', { capsn: 107989 });
   }
 }
 
@@ -1068,11 +1071,11 @@ function testaddOrUpdateUser() {
 function testGetMember() {
   Logger.info('Starting test - getMember');
   let members = getMembers();
-  let member = members[105576];
+  let member = members[107989];
   if (member) {
     Logger.info('Test member data', { member: member });
   } else {
-    Logger.error('Test member not found', { capsn: 105576 });
+    Logger.error('Test member not found', { capsn: 107989 });
   }
 }
 
@@ -1098,4 +1101,190 @@ function testSaveCurrentMembersData() {
   Logger.info('Starting test - saveCurrentMemberData');
   saveCurrentMemberData({});
   Logger.info('Test completed');
+}
+
+/**
+ * Assigns manager email for each member based on their unit commander from Commanders.txt
+ * @param {Object} members - Members object indexed by CAPID
+ */
+function assignManagerEmails(members) {
+  const commandersData = parseFile('Commanders');
+  const commanders = {};
+
+  // Build commander map: ORGID → commander email (ORGID = col 1, CAPID = col 5)
+  for (let i = 0; i < commandersData.length; i++) {
+    const orgid = commandersData[i][0];
+    const commanderCAPID = commandersData[i][4];
+    if (members[commanderCAPID]) {
+      const commander = members[commanderCAPID];
+      const email = `${commander.firstName.toLowerCase()}.${commander.lastName.toLowerCase()}@${CONFIG.DOMAIN}`;
+      commanders[orgid] = email;
+    }
+  }
+
+  // Assign managerEmail for each member in same org
+  for (const capid in members) {
+    const m = members[capid];
+    m.managerEmail = commanders[m.orgid] || '';
+  }
+
+  Logger.info('Manager emails assigned', { count: Object.keys(commanders).length });
+}
+
+/**
+ * Generates an OAuth2 token for a service account to impersonate a user.
+ * This is required for APIs like Gmail settings that have strict delegation rules.
+ * @param {string} userToImpersonate The email address of the user to impersonate.
+ * @param {string} scope The OAuth2 scope(s) required for the API call.
+ * @returns {string} The access token.
+ */
+function getImpersonatedToken_(userToImpersonate, scope) {
+  // TODO: Fill in these values from your GCP Service Account JSON key file.
+  const SERVICE_ACCOUNT_EMAIL = "capwatch@pcr-capwatch.iam.gserviceaccount.com";
+  const PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDBXg5DVixU//de\nxT8l42j+BWsYW2G6PmkJp8iewdiWU+KtARsKzXYXmksvAyHIbEiyweENCr0E2WVI\nHoXDGDFp0Dhsjn1jnQ3jdky11P3D9wxvMxM+lQ59MqjoIOD/58SCGoJOFF7lt5YK\nh/AeoyHWOzv4R8uim9I1WLooxaP543WF67z9yKKc4gSGyuWTBMIP5/6UG97Ow7eC\n6pHNLKqT3RCCfH1RK/tY3k5Z6F6ASeYNlfVla1ZyW+RHpQztFTzrAOkueeIq/N21\nTDVBJUCjTA/sHQBQeGAhViA1qIgvmbhU32k9jgPhYU4Iy88ho444IcBXD0aWoccY\nr5WPYS1jAgMBAAECggEAKZF3HnmhaRpniqt7ckErWmQ+zAsk/J0bBnTXt20zisl4\nsrlIn29gwh0sqWwScJv6mtb78spKrQaw86qAFdsXEEivQIL3KJlkGXBeeD5T2TM8\nLJF9wxfW+AoSbmhXBhxETbW2KmPNrLNlIVlswKFQDlZIg4ynlYrKyyYKSuaF5Btm\nVewmypRHapUJVLWViSKBb7/X4jc/sK6caJyn294EKIP70b4ihzP47RT/5vY2khFP\n5Opw10wjEjlDtOF3fwLAQPJ+8LhpbnWIy707ugKvjZc0IGAY6s8dCT9ZikyrGPtj\nEPpY5dXv8kYmYmFTOiq1j8hLUYn8n8ftcNjQ9j0c+QKBgQDtVnBUxetn2lsRIKcU\nGbJRb/ZWI2s/GdZNMKLPY+hvW4Lh6D+Ha/EJsLmk/Yhqq97Uq9xFyEWmwMLnt8Tk\nCqDTIVThT4nlrJbwKOOYNuP0xJGdT9KCdcGWxw30gIMpfGBuPf6Ayv75SWo6ucfY\noihnlz73J++k1yE0Zc7gwWBJGwKBgQDQkoEb3oRPgSGRb3s03U5ulcNiLCWnqGJQ\n2dVrfZMg8crTfV/jma9YFbuiZJz6ie3RInLHVzVAhJdl3AR1TXCxRwKNpAVqgvEF\naTFpOLE38yN697j+CIEFlRyzafOCz9osWJz4Lhy24G3BZNgNE01UNc7E03uALCwM\nHIJihq55WQKBgQCA0HNzb2CPI1Jd/2zvWesQjEYVBnBE9U784jLbgQw8tFxbJGSm\nqY1Phx2bUQfjbZkpsIWDUmmLUf/3KCSy6JnVPbgF+deMUpoxit/MU65xwOaPjS1i\nJWuG3E7Ur5OAxsLH0tn5KTQuNQx1BzRSfeCUKODB4GkO/LxG5iLcldgelQKBgE8p\na8tSF1G9pyn18ANOg7hBK1kVfG034ajiJLiZfsAgRWUjzsMpz31VMlQeb94/f33C\n32F9Xf7Q1E2axi5naABA/V0ZBd05OZVeKZzQIaMkqzC+2P3B6IZf4/bMndnmXd46\n+8jOZ6OZZs7iIYZE7zKpAYN+6P7qxQULxQj0KUBxAoGBAN7VMmQxAub1yGa5/TDv\n/+8SOi/xxYBJO0YDUQxzpzq7v86dv1X3RebYeAsJD6uAnUpKlICz1vBIw9aNaz00\nvEhAhvE1YR3FkEhyF+QVllZCXsn6yp27G6e1M9HmvXAwFquOcus2AvWPQBFMqqu3\n32zH63Uoe2LI70o2rgunqnns\n-----END PRIVATE KEY-----\n";
+
+  const now = Math.floor(Date.now() / 1000);
+
+  const claimSet = {
+    iss: SERVICE_ACCOUNT_EMAIL,
+    sub: userToImpersonate,
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600, // Token is valid for 1 hour
+    iat: now,
+    scope: scope
+  };
+
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const toSign = `${Utilities.base64EncodeWebSafe(JSON.stringify(header))}.${Utilities.base64EncodeWebSafe(JSON.stringify(claimSet))}`;
+  
+  const signature = Utilities.computeRsaSha256Signature(toSign, PRIVATE_KEY);
+  const jwt = `${toSign}.${Utilities.base64EncodeWebSafe(signature)}`;
+
+  const response = UrlFetchApp.fetch('https://oauth2.googleapis.com/token', {
+    method: 'post',
+    contentType: 'application/x-www-form-urlencoded',
+    payload: {
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt
+    }
+  });
+
+  const token = JSON.parse(response.getContentText());
+  return token.access_token;
+}
+
+
+/**
+ * Adds Gmail aliases for users listed in the "Aliases" sheet using direct impersonation.
+ * This bypasses limitations in the standard Gmail advanced service by having the service
+ * account directly act as the target user. It also intelligently skips admin users.
+ */
+function addAliasesFromSheet() {
+  Logger.info('Starting alias creation from sheet using direct impersonation.');
+
+  const sheet = SpreadsheetApp.openById(CONFIG.AUTOMATION_SPREADSHEET_ID).getSheetByName('Aliases');
+  if (!sheet) {
+    Logger.error('Aliases sheet not found');
+    return;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  data.shift(); // Remove header
+
+  let totalProcessed = 0;
+  let totalAdded = 0;
+  let totalFailed = 0;
+  let totalSkipped = 0;
+
+  const scope = 'https://www.googleapis.com/auth/gmail.settings.sharing';
+
+  for (let i = 0; i < data.length; i++) {
+    const primaryEmail = data[i][0];
+    const aliasEmail = data[i][1];
+    const displayName = data[i][2] || aliasEmail;
+
+    if (!primaryEmail || !aliasEmail) continue;
+    totalProcessed++;
+
+    // Check if the user is an administrator
+    try {
+      const user = AdminDirectory.Users.get(primaryEmail, {fields: 'isAdmin'});
+      if (user.isAdmin) {
+        Logger.info('Skipping admin user (aliases must be set manually)', { user: primaryEmail });
+        totalSkipped++;
+        continue;
+      }
+    } catch (e) {
+      Logger.error('Could not check admin status for user', { user: primaryEmail, error: e.message });
+      totalFailed++;
+      continue;
+    }
+
+    let accessToken;
+    try {
+      // Get a specific token to act AS the target user.
+      accessToken = getImpersonatedToken_(primaryEmail, scope);
+    } catch (e) {
+      Logger.error('Fatal: Could not get impersonated token for user. Check DWD settings for the service account. Error: ' + e.message, { user: primaryEmail });
+      totalFailed++;
+      continue; // Skip to the next user
+    }
+
+    try {
+      const sendAs = {
+        sendAsEmail: aliasEmail,
+        displayName: displayName,
+        treatAsAlias: true
+      };
+      
+      const apiUrl = `https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs`;
+      
+      const response = UrlFetchApp.fetch(apiUrl, {
+        method: 'post',
+        contentType: 'application/json',
+        headers: {
+          'Authorization': 'Bearer ' + accessToken
+        },
+        payload: JSON.stringify(sendAs),
+        muteHttpExceptions: true
+      });
+
+      const responseCode = response.getResponseCode();
+      if (responseCode >= 200 && responseCode < 300) {
+        Logger.info('Alias added successfully', {
+          primary: primaryEmail,
+          alias: aliasEmail
+        });
+        totalAdded++;
+      } else if (responseCode === 409) {
+        Logger.info('Alias already exists, skipping.', {
+          primary: primaryEmail,
+          alias: aliasEmail
+        });
+        totalSkipped++;
+      } else {
+        Logger.error('Failed to add alias', {
+          primary: primaryEmail,
+          alias: aliasEmail,
+          errorMessage: response.getContentText(),
+          responseCode: responseCode
+        });
+        totalFailed++;
+      }
+    } catch (err) {
+      Logger.error('Unhandled exception during alias creation', {
+        primary: primaryEmail,
+        alias: aliasEmail,
+        errorMessage: err.message
+      });
+      totalFailed++;
+    }
+  }
+
+  Logger.info('Alias creation completed', {
+    processed: totalProcessed,
+    added: totalAdded,
+    failed: totalFailed,
+    skipped: totalSkipped
+  });
 }

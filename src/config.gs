@@ -1,6 +1,14 @@
 /**
+ * File: config.gs
+ * Description: Centralized configuration and constants for CAPWATCH automation scripts.
+ * Provides organization-specific parameters, email domains, folder IDs, and time zone mapping.
+ * Author: Noel Luneau
+ * Date: November 14, 2025
+ */
+
+/**
  * Configuration Constants
- * 
+ *
  * Centralized configuration for CAPWATCH automation system.
  * Update these values to match your organization's settings.
  */
@@ -20,14 +28,14 @@ const CONFIG = {
    * Members who expire will remain active for this many days before suspension
    */
   SUSPENSION_GRACE_DAYS: 7,
-  
+
   /**
    * Organization IDs that should have users suspended
    * These typically represent transition or inactive units
    * MI-000 (744) and MI-999 (1920) are holding units for members in transition
    */
-  EXCLUDED_ORG_IDS: ['744', '1920'],
-  
+  EXCLUDED_ORG_IDS: ['1345', ''],
+
   /**
    * Special organization configurations
    */
@@ -38,19 +46,42 @@ const CONFIG = {
      */
     AEM_UNIT: '182'
   },
-  
+
   /**
    * Number of members to process in each batch
    * Used by batchUpdateMembers() to group API calls
    */
   BATCH_SIZE: 50,
-  
+
+  /**
+   * Maximum number of retry attempts for API calls
+   * Used by executeWithRetry() in utils.gs
+   */
   /**
    * Maximum number of retry attempts for API calls
    * Used by executeWithRetry() in utils.gs
    */
   API_RETRY_ATTEMPTS: 3,
-  
+
+  /**
+   * Delay (milliseconds) between each API call to prevent 403 quota errors
+   */
+  API_DELAY_MS: 250,
+
+  /**
+   * Base delay (milliseconds) for exponential backoff after quota errors
+   */
+  API_BACKOFF_BASE_MS: 3000,
+
+  /**
+   * Maximum number of users to process in a single execution
+   * Safety limit to prevent runaway processing
+   *
+   * If more users need processing, they'll be handled in the next run.
+   * Set to a reasonable limit based on your user volume and script timeout.
+   */
+  MAX_BATCH_SIZE: 100,
+
   /**
    * Member type definitions
    * Determines which member types are processed in different scenarios
@@ -61,49 +92,62 @@ const CONFIG = {
     /** Only Aerospace Education Members */
     AEM_ONLY: ['AEM']
   },
-  
+
   /**
    * CAPWATCH organization ID for data download
    * This should be your Wing ORGID
    * MI Wing = 223
    */
-  CAPWATCH_ORGID: '223',
-  
+  CAPWATCH_ORGID: '434',
+
   /**
    * Wing abbreviation
    * Used for building squadron identifiers
    */
-  WING: "MI",
-  
+
+  REGION: "PCR",
+
+  /**
+  * If unit is a Region, set three letter abbreviation here
+  */
+
+  WING: "PCR",
+
   /**
    * Email domain for CAP accounts
    * All members get username@miwg.cap.gov
    */
-  EMAIL_DOMAIN: "@miwg.cap.gov",
-  
+  EMAIL_DOMAIN: "@pcrcap.org",
+
   /**
    * Google Workspace domain
    * Used for API calls
    */
-  DOMAIN: "miwg.cap.gov",
-  
+  DOMAIN: "pcrcap.org",
+
   /**
    * Google Drive folder ID where CAPWATCH data files are stored
    * Downloaded files (Member.txt, Organization.txt, etc.) go here
    */
-  CAPWATCH_DATA_FOLDER_ID: '<id for the folder here>',
-  
+  CAPWATCH_DATA_FOLDER_ID: '1SnDwtYfrhkJttqSYgY9wDA2ANDWDvIto',
+
   /**
    * Google Drive folder ID for automation files
    * Contains configuration spreadsheets and logs
    */
-  AUTOMATION_FOLDER_ID: '<id for the folder here>',
-  
+  AUTOMATION_FOLDER_ID: '11kbKDKLQWG6cINfVILVu-4Q8tc2z6Q9v',
+
   /**
    * Google Sheets ID for automation configuration
    * Contains 'Groups', 'User Additions', 'Error Emails' sheets
    */
-  AUTOMATION_SPREADSHEET_ID: '<id for the spreadsheet here>'
+  AUTOMATION_SPREADSHEET_ID: '1vaMVevYP_votBNfXpr_Dibwzt0VPD02o5CvksLQHrOY',
+
+  /**
+   * Set to false to update all user signatures
+   */
+
+   UPDATE_SIGNATURE_ON_NEW_USERS_ONLY: true,
 };
 
 /**
@@ -114,16 +158,16 @@ const CONFIG = {
 const ERROR_CODES = {
   /** Invalid request (bad parameters, malformed data) */
   BAD_REQUEST: 400,
-  
+
   /** Insufficient permissions */
   FORBIDDEN: 403,
-  
+
   /** Resource not found (user, group, etc.) */
   NOT_FOUND: 404,
-  
+
   /** Resource already exists or conflict */
   CONFLICT: 409,
-  
+
   /** Google server error (usually transient) */
   SERVER_ERROR: 500
 };
@@ -149,22 +193,22 @@ const GROUP_MEMBER_PAGE_SIZE = 200;
 const RETENTION_LOG_SPREADSHEET_ID = '<id for the spreadsheet here>';
 
 /** Email address for retention Google Group */
-const RETENTION_EMAIL = '<retention email DL here>';
+const RETENTION_EMAIL = 'noel.luneau@pcrcap.org';
 
 /** Email address for Director of Recruiting and Retention */
-const DIRECTOR_RECRUITING_EMAIL = '<director of RR email here>';
+const DIRECTOR_RECRUITING_EMAIL = 'noel.luneau@pcrcap.org';
 
 /** Email alias to use as sender for automated emails */
-const AUTOMATION_SENDER_EMAIL = '<retention workflows email here>';
+const AUTOMATION_SENDER_EMAIL = 'automation@pcrcap.org';
 
 /** Display name for automated email sender */
-const SENDER_NAME = '<name of RR Director here>, Director of Recruiting & Retention';
+const SENDER_NAME = 'Noel Luneau, Lt Col, Director of Recruiting & Retention';
 
 /** Test email address for development/testing */
-const TEST_EMAIL = '<email for testing notifications here>';
+const TEST_EMAIL = 'noel.luneau@pcrcap.org';
 
 /** IT support mailbox for notifications */
-const ITSUPPORT_EMAIL = '<it support email here>'
+const ITSUPPORT_EMAIL = 'it@pcrcap.org'
 
 /**
  * Configuration for retention email system
@@ -179,7 +223,7 @@ const RETENTION_CONFIG = {
     TURNING_21: 'Important Membership Update - Turning 21',
     EXPIRING: 'Your CAP Membership Expires Soon'
   },
-  
+
   /**
    * Age thresholds for email triggers
    */
@@ -187,12 +231,12 @@ const RETENTION_CONFIG = {
     TRANSITION_TO_SENIOR: 18,
     CADET_AGE_OUT: 21
   },
-  
+
   /**
    * Email rate limiting (milliseconds between sends)
    */
   EMAIL_DELAY_MS: 100,
-  
+
   /**
    * Progress logging frequency (log every N emails)
    */
@@ -211,21 +255,21 @@ const LICENSE_CONFIG = {
   /**
    * Number of days a user must be suspended before being archived
    * Default: 365 days (1 year)
-   * 
+   *
    * When a user is suspended for this long AND not active in CAPWATCH,
    * they will be moved to archived status to free up standard licenses.
    */
   DAYS_BEFORE_ARCHIVE: 365,
-  
+
   /**
    * Number of days a user must be archived before being deleted
    * Default: 1825 days (5 years)
-   * 
+   *
    * When a user has been archived for this long AND not active in CAPWATCH,
    * their account will be permanently deleted.
    */
   DAYS_BEFORE_DELETE: 1825, // 5 years
-  
+
   /**
    * Email addresses to receive license management reports
    * These recipients will get monthly reports of:
@@ -239,15 +283,6 @@ const LICENSE_CONFIG = {
     AUTOMATION_SENDER_EMAIL,     // Backup/monitoring
     ITSUPPORT_EMAIL   // IT Notification
   ],
-  
-  /**
-   * Maximum number of users to process in a single execution
-   * Safety limit to prevent runaway processing
-   * 
-   * If more users need processing, they'll be handled in the next run.
-   * Set to a reasonable limit based on your user volume and script timeout.
-   */
-  MAX_BATCH_SIZE: 100,
-  
+
 };
 
